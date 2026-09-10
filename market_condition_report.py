@@ -1,6 +1,8 @@
 import argparse
 from io import StringIO
+import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta
@@ -479,7 +481,260 @@ def table_rows(df: pd.DataFrame):
     return "\n".join(rows)
 
 
-def build_html(context):
+def forward_volatility(short_iv: float, short_days: float, long_iv: float, long_days: float) -> float:
+    variance = (long_days * long_iv**2 - short_days * short_iv**2) / (long_days - short_days)
+    return float(np.sqrt(variance)) if variance > 0 else np.nan
+
+
+def forward_curve(term_values: np.ndarray) -> np.ndarray:
+    vix_9d, vix_30d, vix_3m, vix_6m = term_values
+    return np.array(
+        [
+            vix_9d,
+            forward_volatility(vix_9d, 9, vix_30d, 30),
+            forward_volatility(vix_30d, 30, vix_3m, 91),
+            forward_volatility(vix_3m, 91, vix_6m, 182),
+        ]
+    )
+
+
+def forward_curve_figure(term_values: np.ndarray):
+    labels = ["0-9D", "9-30D", "30D-3M", "3M-6M"]
+    forwards = forward_curve(term_values)
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=labels,
+            y=term_values,
+            mode="lines+markers",
+            name="Constant-maturity IV",
+            line=dict(color="#7aa2f7", width=3),
+            marker=dict(size=8),
+            hovertemplate="%{x}<br>IV: %{y:.2f}%<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=labels,
+            y=forwards,
+            mode="lines+markers",
+            name="Forward volatility",
+            line=dict(color="#bb9af7", width=3, dash="dash"),
+            marker=dict(size=8),
+            hovertemplate="%{x}<br>Forward vol: %{y:.2f}%<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        height=300,
+        margin=dict(l=38, r=16, t=42, b=36),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        yaxis=dict(title="Volatility %", gridcolor="rgba(255,255,255,.08)", tickfont=dict(color="#8f9bad")),
+        xaxis=dict(gridcolor="rgba(255,255,255,.03)", tickfont=dict(color="#8f9bad")),
+        legend=dict(orientation="h", y=1.18, x=0, font=dict(color="#8f9bad", size=11)),
+        font=dict(color="#e8edf5"),
+        hovermode="x unified",
+    )
+    return fig
+
+
+def rolling_rank(series: pd.Series, window: int = 252) -> pd.Series:
+    return series.rolling(window, min_periods=63).rank(pct=True)
+
+
+def status_for_score(score: float, low: str, middle: str, high: str) -> tuple[str, str]:
+    if pd.isna(score):
+        return "N/A", ""
+    if score >= 0.80:
+        return high, "bad"
+    if score >= 0.60:
+        return middle, "elev"
+    return low, "good"
+
+
+def build_state_context(mkt: pd.DataFrame, vix_term_df: pd.DataFrame) -> dict:
+    aligned = mkt.join(vix_term_df[TENOR_COLS], how="inner")
+    front_spread = aligned["VIX_9D"] - aligned["VIX_30D"]
+    scores = pd.DataFrame(index=aligned.index)
+    scores["level"] = rolling_rank(aligned["mkt_vix_level"])
+    scores["momentum"] = rolling_rank(aligned["mkt_vix_ret_5d"])
+    scores["front"] = rolling_rank(front_spread)
+    scores["tail"] = rolling_rank(aligned["mkt_skew_level"])
+    scores["vrp"] = rolling_rank(aligned["mkt_vrp_21d"])
+    scores["composite"] = (
+        scores["level"] * 0.30
+        + scores["momentum"] * 0.20
+        + scores["front"] * 0.20
+        + scores["tail"] * 0.15
+        + scores["vrp"] * 0.15
+    )
+
+    latest = aligned.iloc[-1]
+    previous = aligned.iloc[-6]
+    latest_scores = scores.iloc[-1]
+    previous_scores = scores.iloc[-6]
+    composite = float(latest_scores["composite"] * 100)
+    prior_composite = float(previous_scores["composite"] * 100)
+    delta = composite - prior_composite
+
+    if delta >= 5:
+        direction = "Deteriorating ↘"
+    elif delta <= -5:
+        direction = "Improving ↗"
+    else:
+        direction = "Stable →"
+
+    regime, _ = regime_label(latest["mkt_vix_level"])
+    surface = classify_surface(latest, latest[TENOR_COLS].values.astype(float))
+    if latest["VIX_9D"] > latest["VIX_30D"] or surface["shape"] == "Backwardation":
+        qualifier = "FRAGILE"
+    elif latest_scores["tail"] >= 0.80:
+        qualifier = "TAIL-RICH"
+    elif latest_scores["vrp"] >= 0.80:
+        qualifier = "PREMIUM-RICH"
+    elif surface["shape"] == "Contango" and latest["mkt_vix_level"] < 20:
+        qualifier = "BALANCED"
+    else:
+        qualifier = "TRANSITION"
+
+    momentum_status = "RISING" if latest["mkt_vix_ret_5d"] > 0.10 else "FALLING" if latest["mkt_vix_ret_5d"] < -0.10 else "STABLE"
+    momentum_class = "bad" if momentum_status == "RISING" else "good" if momentum_status == "FALLING" else "elev"
+    front_status = "STRESSED" if front_spread.iloc[-1] > 0 else "WATCH" if front_spread.iloc[-1] > -1 else "RELAXED"
+    front_class = "bad" if front_status == "STRESSED" else "elev" if front_status == "WATCH" else "good"
+    level_status, level_class = status_for_score(latest_scores["level"], "NORMAL", "ELEVATED", "HIGH")
+    tail_status, tail_class = status_for_score(latest_scores["tail"], "NORMAL", "ELEVATED", "EXPENSIVE")
+    vrp_status, vrp_class = status_for_score(latest_scores["vrp"], "NORMAL", "RICH", "VERY RICH")
+
+    rows = [
+        ("Level", latest_scores["level"], f"{latest_scores['level']:.0%}", level_status, level_class),
+        ("Momentum", latest_scores["momentum"], f"{latest['mkt_vix_ret_5d']:+.1%}", momentum_status, momentum_class),
+        ("Front end", latest_scores["front"], f"{front_spread.iloc[-1]:+.2f}", front_status, front_class),
+        ("Tail risk", latest_scores["tail"], f"{latest_scores['tail']:.0%}", tail_status, tail_class),
+        ("IV-RV", latest_scores["vrp"], f"{latest['mkt_vrp_21d']:+.1f}", vrp_status, vrp_class),
+    ]
+
+    description = (
+        f"VIX is {regime.lower()} at {latest['mkt_vix_level']:.2f}. The curve is {surface['shape'].lower()}, "
+        f"the 9D-to-30D spread is {front_spread.iloc[-1]:+.2f} points, and SKEW ranks at "
+        f"{latest_scores['tail']:.0%} of its trailing-year range. The composite stress score is {composite:.0f}/100."
+    )
+    interpretation = " ".join([surface["shape_text"], surface["front_text"], surface["belly_text"]])
+    transition_note = (
+        f"Front-end spread {front_spread.iloc[-1] - front_spread.iloc[-6]:+.2f} pts • "
+        f"SKEW {latest['mkt_skew_level'] - previous['mkt_skew_level']:+.1f} • "
+        f"IV-RV {latest['mkt_vrp_21d'] - previous['mkt_vrp_21d']:+.1f}"
+    )
+    return {
+        "scores": latest_scores,
+        "rows": rows,
+        "regime": regime.upper(),
+        "qualifier": qualifier,
+        "description": description,
+        "interpretation": interpretation,
+        "direction": direction,
+        "composite": composite,
+        "previous_composite": prior_composite,
+        "delta": delta,
+        "previous_vix": float(previous["mkt_vix_level"]),
+        "transition_note": transition_note,
+    }
+
+
+def find_analog_outcomes(
+    mkt: pd.DataFrame,
+    latest: pd.Series,
+    spy: pd.DataFrame,
+    max_rows: int = 20,
+    min_separation: int = 21,
+) -> pd.DataFrame:
+    cols = ["mkt_vix_level", "mkt_vix_slope_30d_3m", "mkt_vix_curvature", "mkt_vrp_21d", "mkt_skew_level"]
+    close = spy.iloc[:, 0].rename("spy_close").dropna()
+    joined = mkt[cols].join(close, how="inner").dropna()
+    if len(joined) < 315:
+        return pd.DataFrame()
+
+    candidates = joined.iloc[:-63].copy()
+    means = candidates[cols].mean()
+    stds = candidates[cols].std().replace(0, np.nan)
+    target = latest[cols]
+    candidates["distance"] = np.sqrt((((candidates[cols] - means) / stds - (target - means) / stds) ** 2).sum(axis=1))
+
+    selected = []
+    positions = {date: pos for pos, date in enumerate(joined.index)}
+    for date, row in candidates.sort_values("distance").iterrows():
+        pos = positions[date]
+        if any(abs(pos - chosen) < min_separation for chosen in selected):
+            continue
+        selected.append(pos)
+        if len(selected) >= max_rows:
+            break
+
+    records = []
+    for pos in selected:
+        date = joined.index[pos]
+        row = joined.iloc[pos]
+        record = row.to_dict()
+        record["date"] = date
+        record["distance"] = float(candidates.at[date, "distance"])
+        record["curve"] = "Backwardation" if row["mkt_vix_slope_30d_3m"] < 0 else "Compressed" if row["mkt_vix_slope_30d_3m"] < 1 else "Contango"
+        for horizon in (5, 21, 63):
+            start_close = joined.iloc[pos]["spy_close"]
+            path = joined.iloc[pos : pos + horizon + 1]["spy_close"]
+            record[f"ret_{horizon}"] = (path.iloc[-1] / start_close - 1) * 100
+            record[f"dd_{horizon}"] = float((path / path.cummax() - 1).min() * 100)
+        records.append(record)
+    return pd.DataFrame(records).set_index("date") if records else pd.DataFrame()
+
+
+def outcome_configs(analogs: pd.DataFrame) -> dict:
+    configs = {}
+    bins = [-np.inf, -10, -5, 0, 5, 10, np.inf]
+    for horizon in (5, 21, 63):
+        returns = analogs[f"ret_{horizon}"].dropna()
+        drawdowns = analogs[f"dd_{horizon}"].dropna()
+        histogram = pd.cut(returns, bins=bins, right=False).value_counts(sort=False)
+        percentages = (histogram / max(len(returns), 1) * 100).round().astype(int).tolist()
+        maximum = max(percentages) if percentages else 1
+        median_return = float(returns.median())
+        median_drawdown = float(drawdowns.median())
+        if median_return > 1:
+            bias = "constructive"
+        elif median_return < -1:
+            bias = "defensive"
+        else:
+            bias = "mixed"
+        risk = "material path risk" if median_drawdown <= -5 else "contained median drawdown"
+        configs[f"{horizon}D"] = {
+            "ret": f"{median_return:+.1f}%",
+            "retValue": round(median_return, 3),
+            "hit": f"{(returns > 0).mean():.0%}",
+            "dd": f"{median_drawdown:.1f}%",
+            "hist": percentages,
+            "histWidths": [round(value / maximum * 100) if maximum else 0 for value in percentages],
+            "text": f"Historical {horizon}-session bias is {bias}, with {risk} across {len(returns)} independent analogs.",
+        }
+    return configs
+
+
+def analog_table_rows(analogs: pd.DataFrame, rows: int = 6) -> str:
+    html_rows = []
+    for date, row in analogs.head(rows).iterrows():
+        data = " ".join(
+            f'data-ret{horizon}d="{row[f"ret_{horizon}"]:.4f}" data-dd{horizon}d="{row[f"dd_{horizon}"]:.4f}"'
+            for horizon in (5, 21, 63)
+        )
+        ret = row["ret_21"]
+        html_rows.append(
+            f'<tr class="analog-row" {data}>'
+            f"<td>{date:%Y-%m-%d}</td><td>{row['distance']:.2f}</td><td>{row['mkt_vix_level']:.1f}</td>"
+            f"<td>{row['curve']}</td><td>{row['mkt_skew_level']:.0f}</td>"
+            f'<td class="analog-return {"pos" if ret >= 0 else "neg"}">{ret:+.1f}%</td>'
+            f'<td class="analog-drawdown">{row["dd_21"]:.1f}%</td></tr>'
+        )
+    return "\n".join(html_rows)
+
+
+def _build_legacy_html(context):
     surface_html = context["surface_fig"].to_html(
         include_plotlyjs=True, full_html=False, div_id="vix-surface", config=PLOTLY_CONFIG
     )
@@ -734,6 +989,132 @@ th {{ color: var(--muted); font-size: 11px; text-transform: uppercase; }}
 </html>"""
 
 
+def build_html(context: dict) -> str:
+    latest = context["latest"]
+    mkt = context["mkt"]
+    vix_term_df = context["vix_term_df"]
+    term_values = context["term_values"]
+    forwards = context["forward_values"]
+    surface = context["surface"]
+    state = context["state"]
+    analogs = context["analogs"]
+    configs = outcome_configs(analogs)
+    default = configs["21D"]
+
+    forward_html = context["forward_fig"].to_html(
+        include_plotlyjs=True,
+        full_html=False,
+        div_id="forward-curve",
+        config=PLOTLY_CONFIG,
+    )
+    surface_html = context["surface_fig"].to_html(
+        include_plotlyjs=False,
+        full_html=False,
+        div_id="vix-surface",
+        config=PLOTLY_CONFIG,
+    )
+
+    state_rows = []
+    for label, score, value, status, klass in state["rows"]:
+        width = 0 if pd.isna(score) else int(np.clip(round(score * 100), 0, 100))
+        state_rows.append(
+            f'<div class="row"><span>{label}</span><div class="bar"><div class="fill" style="width:{width}%"></div></div>'
+            f'<span class="tag">{value}</span><span class="status {klass}">{status}</span></div>'
+        )
+
+    histogram_labels = ["< -10%", "-10 to -5%", "-5 to 0%", "0 to 5%", "5 to 10%", "> 10%"]
+    histogram_rows = "\n".join(
+        f'<div class="histrow"><span>{label}</span><div class="histbar"><span style="width:{width}%"></span></div><b>{value}%</b></div>'
+        for label, width, value in zip(histogram_labels, default["histWidths"], default["hist"])
+    )
+
+    vix_5d_change = latest["mkt_vix_level"] - mkt["mkt_vix_level"].iloc[-6]
+    vix9d_series = vix_term_df["VIX_9D"]
+    vix9d_5d_change = vix9d_series.iloc[-1] - vix9d_series.iloc[-6]
+    slope_5d_change = latest["mkt_vix_slope_30d_3m"] - mkt["mkt_vix_slope_30d_3m"].iloc[-6]
+    front_class = "stress" if term_values[0] > term_values[1] else ""
+    forward_note = (
+        "near-term event premium is front-loaded"
+        if term_values[0] > forwards[1] + 1
+        else "risk builds beyond the first nine days"
+        if forwards[1] > term_values[0] + 1
+        else "near-term risk is evenly distributed"
+    )
+    forward_readthrough = (
+        f"The 0-9D segment is {forwards[0]:.1f}% and the 9-30D forward segment is {forwards[1]:.1f}%. "
+        f"The 30D-3M and 3M-6M forward segments are {forwards[2]:.1f}% and {forwards[3]:.1f}%, respectively. "
+        f"This is consistent with {surface['shape'].lower()} and {forward_note}."
+    )
+    ridge = "front-loaded" if term_values[0] > term_values[-1] + 0.5 else "back-loaded" if term_values[-1] > term_values[0] + 0.5 else "balanced"
+    current_score = int(np.clip(round(state["composite"]), 2, 98))
+    previous_score = int(np.clip(round(state["previous_composite"]), 2, 98))
+    vix_rank = state["scores"]["level"]
+    vix9d_rank = rolling_rank(vix9d_series).iloc[-1]
+    vrp_rank = state["scores"]["vrp"]
+    skew_rank = state["scores"]["tail"]
+    vrp_status = status_for_score(vrp_rank, "normal", "rich", "very rich")[0].lower()
+    skew_status = status_for_score(skew_rank, "normal", "elevated", "tail expensive")[0].lower()
+
+    replacements = {
+        "DATE": context["date_str"],
+        "SOURCE_LABEL": context["source_label"],
+        "SOURCE_NOTE": context["source_note"],
+        "GENERATED_AT": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z"),
+        "REGIME": state["regime"],
+        "STATE_QUALIFIER": state["qualifier"],
+        "STATE_DESCRIPTION": state["description"],
+        "STATE_DIRECTION": state["direction"],
+        "STATE_DELTA": f"{state['delta']:+.0f} points / 5D",
+        "VIX": f"{latest['mkt_vix_level']:.2f}",
+        "VIX_RANK": f"{vix_rank:.0%}",
+        "VIX_CHANGE": f"{vix_5d_change:+.2f}",
+        "VIX_CHANGE_CLASS": "stress" if vix_5d_change > 0 else "ok",
+        "VIX9D": f"{term_values[0]:.2f}",
+        "VIX9D_RANK": f"{vix9d_rank:.0%}",
+        "VIX9D_CHANGE": f"{vix9d_5d_change:+.2f}",
+        "FRONT_CLASS": front_class,
+        "SLOPE": f"{latest['mkt_vix_slope_30d_3m']:+.2f}",
+        "SURFACE_SHAPE": surface["shape"].lower(),
+        "SLOPE_CHANGE": f"{slope_5d_change:+.2f}",
+        "FORWARD_9_30": fmt(forwards[1], 1),
+        "FORWARD_NOTE": forward_note,
+        "VRP": f"{latest['mkt_vrp_21d']:+.1f}",
+        "VRP_RANK": f"{vrp_rank:.0%}",
+        "VRP_STATUS": vrp_status,
+        "SKEW": f"{latest['mkt_skew_level']:.1f}",
+        "SKEW_RANK": f"{skew_rank:.0%}",
+        "SKEW_STATUS": skew_status,
+        "STATE_VECTOR_ROWS": "\n".join(state_rows),
+        "STATE_INTERPRETATION": state["interpretation"],
+        "FORWARD_FIGURE": forward_html,
+        "FORWARD_READTHROUGH": forward_readthrough,
+        "PREVIOUS_SCORE": previous_score,
+        "CURRENT_SCORE": current_score,
+        "PREVIOUS_VIX": f"{state['previous_vix']:.2f}",
+        "TRANSITION_NOTE": state["transition_note"],
+        "LOOKBACK": context["lookback"],
+        "RIDGE": ridge,
+        "SURFACE_PEAK": f"{max(term_values):.1f}",
+        "VIX6M": f"{term_values[-1]:.1f}",
+        "SURFACE_FIGURE": surface_html,
+        "ANALOG_ROWS": analog_table_rows(analogs),
+        "MEDIAN_RETURN": default["ret"],
+        "HIT_RATE": default["hit"],
+        "MEDIAN_DRAWDOWN": default["dd"],
+        "ANALOG_COUNT": len(analogs),
+        "HISTOGRAM_ROWS": histogram_rows,
+        "OUTCOME_INTERPRETATION": default["text"],
+        "OUTCOME_CONFIGS": json.dumps(configs, separators=(",", ":")),
+    }
+    html = (SCRIPT_DIR / "report_template.html").read_text(encoding="utf-8")
+    for key, value in replacements.items():
+        html = html.replace(f"@@{key}@@", str(value))
+    remaining = sorted(set(re.findall(r"@@([A-Z0-9_]+)@@", html)))
+    if remaining:
+        raise ValueError(f"Unresolved report template placeholders: {remaining}")
+    return html
+
+
 def generate_report(
     start: str,
     end: str,
@@ -767,17 +1148,26 @@ def generate_report(
     date_str = mkt.index[-1].strftime("%Y-%m-%d")
 
     surface_df, x_fine, y_fine, z_fine = build_surface(vix_term_df, lookback)
+    surface = classify_surface(latest, term_values)
+    state = build_state_context(mkt, vix_term_df)
+    analogs = find_analog_outcomes(mkt, latest, odm._raw["spy"])
+    if len(analogs) < 6:
+        raise ValueError("Not enough independent historical analogs with forward outcomes.")
+    forward_values = forward_curve(term_values)
     context = {
         "date_str": date_str,
         "lookback": len(surface_df),
         "latest": latest,
+        "mkt": mkt,
+        "vix_term_df": vix_term_df,
         "term_values": term_values,
         "term_changes": term_changes,
-        "surface": classify_surface(latest, term_values),
+        "forward_values": forward_values,
+        "surface": surface,
+        "state": state,
         "surface_fig": surface_figure(surface_df, x_fine, y_fine, z_fine),
-        "curve_fig": term_structure_figure(vix_term_df),
-        "timeseries_fig": time_series_figure(mkt),
-        "analogs": find_analog_days(mkt, latest),
+        "forward_fig": forward_curve_figure(term_values),
+        "analogs": analogs,
         "surface_min": float(np.nanmin(z_fine)),
         "surface_max": float(np.nanmax(z_fine)),
         "source_note": source_note,

@@ -4,6 +4,10 @@ An interactive, static VIX term-structure report generated from official Cboe
 end-of-day index histories. SPY adjusted closes from yfinance are used only for
 realized-volatility calculations.
 
+The report combines a current volatility-state vector, forward-variance curve,
+five-session state transition, interactive 3D term surface, and independent
+historical analog outcomes at 5, 21, and 63 trading sessions.
+
 The published page is rebuilt after each U.S. trading day by GitHub Actions.
 The generated HTML is deployed as a GitHub Pages artifact and is not committed
 to Git history on each refresh.
