@@ -4,7 +4,12 @@ on:
   push:
     branches: [main]
   schedule:
-    - cron: "30 23 * * 1-5"
+    # GitHub schedules can start late, and Cboe's daily index CSVs do not
+    # always publish together. Retry after each U.S. session so a later run
+    # can pick up the newest common official date without mixing sessions.
+    - cron: "17 23 * * 1-5"
+    - cron: "17 3 * * 2-6"
+    - cron: "17 7 * * 2-6"
   workflow_dispatch:
 
 permissions:
